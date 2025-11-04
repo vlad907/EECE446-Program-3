@@ -14,6 +14,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <dirent.h>
+#include <stdint.h>
+#include <arpa/inet.h>
 
 /*
  * Lookup a host IP address and connect to it using service. Arguments match the first two
@@ -23,34 +25,24 @@
  * the returned socket.
  */
 
-/*
- *   Resources:
- * https://beej.us/guide/bgnet/html/split/slightly-advanced-techniques.html#sendall
- * https://www.ibm.com/docs/en/i/7.4.0?topic=functions-strstr-locate-substring
- * https://stackoverflow.com/questions/35747707/null-terminate-string-use-0-or-just-0
- * https://www.ibm.com/docs/en/cobol-zos/6.3.0?topic=options-buf
- * 
- */
+
 int sendall(int s, const char *buf, size_t len);
 int recvall(int s, char *buf, size_t len);
 int lookup_and_connect( const char *host, const char *service );
 
+static int handle_join(int sock, uint32_t id);
+static int handle_publish(int sock);
+static int handle_search(int sock);
+static int handle_fetch(int sock);
+
+static int read_command(char *buffer, size_t size);
+
 
 int main(int argc, char *argv[]) {
-        int s;                                                          
-        char *host = ""; // Host address
-        char *port = ""; // Port
+        const char *host = ""; // Host address
+        const char *port = ""; // Port
         uint32_t id; // Current id.
-        char usrin[255]; // User input
-
-        DIR *pubdir = opendir("SharedFiles");
-        uint32_t pubidx = 5; // The current index in the buffer that we iterate over when adding a new filename.
-        struct dirent *pubfile; // Current shared file.
-
-        uint32_t pid, pubcnt; // Peer id and publish count. 
-
-        uint16_t pp; // Peer port (search)
-        uint8_t pip1, pip2, pip3, pip4; // Peer ip.
+        char command[255]; // User input
 
         // Get arguments.
         if (argc == 4 ) {
@@ -63,67 +55,173 @@ int main(int argc, char *argv[]) {
         }
 
         /* Lookup IP and connect to server */
-        if ( ( s = lookup_and_connect( host, port ) ) < 0 ) {
-                exit( 1 );
+                
+        int sockfd = lookup_and_connect( host, port );
+        if (sockfd < 0) {
+                fprintf(stderr, "Failed to connect to %s:%s\n", host, port);
+                return EXIT_FAILURE;
         }
-
-        char buf[1205]; // Buf used to send requests. I insisted on making it 1205 because our longest possible buffer is for the PUBLISH command, with 1 byte action id, 4 byte count, and the 1200 limit on PUBLISH.
 
         while(1) {
                 printf("Enter a command: ");
-                scanf("%s", usrin);
-                if(strcmp(usrin, "JOIN")==0) {
-                        // Create message with byte 0 as the action id, and the next 4 bytes as id.
-                        buf[0]=0;
-                        id = htonl(id);
-                        /* Alternative method of copying into buf.
-                           buf[1] = (id) & 0xFF;
-                           buf[2] = (id >> 8) & 0xFF;
-                           buf[3] = (id >> 16) & 0xFF;
-                           buf[4] = (id >> 24) & 0xFF;
-                           */
-                        memcpy(buf+1, &id, 4);
-                        sendall(s, buf, sizeof(int)+1); // And then send.
-                } else if(strcmp(usrin, "PUBLISH")==0) {
-                        buf[0]=1;
-                        while((pubfile = readdir(pubdir))!=NULL) {
-                                // Do not iterate over files starting with . 
-                                if(pubfile->d_name[0] != '.') {
-                                        pubcnt++;
-                                        strcpy(buf+pubidx, pubfile->d_name);
-                                        pubidx += strlen(pubfile->d_name)+1;
-                                }
-                        }
-                        pubcnt = htonl(pubcnt);
-                        memcpy(buf+1, &pubcnt, 4);
-                        sendall(s, buf, pubidx);
-                } else if(strcmp(usrin, "SEARCH")==0) {
-                        buf[0]=2; // Action id.
-                        printf("Enter a file name: ");
-                        scanf("%s", usrin);
-                        strcpy(buf + 1, usrin);
-                        sendall(s, buf, 2+strlen(usrin)); // And then send. String + action id + null terminator.
-                        recvall(s, buf, 10); // and recieve returned data.
+                if (read_command(command, sizeof(command)) != 0) {
+                        printf("Failed to read command. Exiting.\n");
+                        break;
+                }
 
-                        memcpy(&pid, buf, 4); // Peer id.
-                        memcpy(&pip1, buf+4, 4); // Peer ip 1.
-                        memcpy(&pip2, buf+5, 4); // Peer ip 2.
-                        memcpy(&pip3, buf+6, 4); // Peer ip 3.
-                        memcpy(&pip4, buf+7, 4); // Peer ip 4.
-                        memcpy(&pp, buf+8, 2); // Peer port.
-
-                        pid = ntohl(pid);
-                        pp = ntohs(pp);
-
-                        if(buf[0]==0) {
-                                printf("File not indexed by registry\n");
-                        } else {
-                                printf("File found at\nPeer %u\n%d.%d.%d.%d:%d\n", pid, pip1, pip2, pip3, pip4, pp);
-                        }
-                } else if(strcmp(usrin, "EXIT")==0) {
-                        return 0;
+                if(strcmp(command, "JOIN")==0) {
+                        handle_join(sockfd, id);
+                } else if(strcmp(command, "PUBLISH")==0) {
+                        handle_publish(sockfd);
+                } else if(strcmp(command, "FETCH")==0) {
+                        handle_fetch(sockfd);
+                } else if(strcmp(command, "SEARCH")==0) {
+                        handle_search(sockfd);
+                } else if(strcmp(command, "EXIT")==0) {
+                        break;
+                } else {
+                        printf("Unrecognized command: %s\n", command);
                 }
         }
+
+        close(sockfd);
+        return 0;
+}
+
+static int handle_join(int sock, uint32_t id) {
+        char buf[1 + sizeof(uint32_t)];
+        uint32_t net_id = htonl(id);
+
+        buf[0] = 0;
+        memcpy(buf + 1, &net_id, sizeof(net_id));
+
+        if (sendall(sock, buf, sizeof(buf)) < 0) {
+                perror("JOIN failed");
+                return -1;
+        }
+
+        return 0;
+}
+
+static int handle_publish(int sock) {
+        char buf[1205]; // 1 byte action, 4 bytes count, 1200 bytes payload
+        size_t buf_idx = 5;
+        uint32_t count = 0;
+        DIR *dir;
+        struct dirent *entry;
+
+        buf[0] = 1;
+
+        dir = opendir("SharedFiles");
+        if (dir == NULL) {
+                perror("Failed to open SharedFiles directory");
+                return -1;
+        }
+
+        while ((entry = readdir(dir)) != NULL) {
+                if (entry->d_name[0] == '.') {
+                        continue;
+                }
+
+                size_t name_len = strlen(entry->d_name);
+                if (buf_idx + name_len + 1 > sizeof(buf)) {
+                        fprintf(stderr, "Publish buffer too small for file: %s\n", entry->d_name);
+                        closedir(dir);
+                        return -1;
+                }
+
+                memcpy(buf + buf_idx, entry->d_name, name_len + 1);
+                buf_idx += name_len + 1;
+                count++;
+        }
+
+        closedir(dir);
+
+        uint32_t net_count = htonl(count);
+        memcpy(buf + 1, &net_count, sizeof(net_count));
+
+        if (sendall(sock, buf, buf_idx) < 0) {
+                perror("PUBLISH failed");
+                return -1;
+        }
+
+        return 0;
+}
+
+static int handle_search(int sock) {
+        char filename[255];
+        char buf[1205];
+        uint32_t pid;
+        uint16_t peer_port;
+        uint8_t peer_ip[4];
+
+        printf("Enter a file name: ");
+        if (scanf("%254s", filename) != 1) {
+                fprintf(stderr, "Failed to read filename\n");
+                return -1;
+        }
+
+        size_t name_len = strlen(filename);
+        if (name_len + 2 > sizeof(buf)) {
+                fprintf(stderr, "Filename too long\n");
+                return -1;
+        }
+
+        buf[0] = 2; // Action id.
+        memcpy(buf + 1, filename, name_len + 1);
+
+        if (sendall(sock, buf, name_len + 2) < 0) {
+                perror("SEARCH send failed");
+                return -1;
+        }
+
+        if (recvall(sock, buf, 10) < 0) {
+                perror("SEARCH receive failed");
+                return -1;
+        }
+
+        memcpy(&pid, buf, sizeof(pid));
+        memcpy(peer_ip, buf + 4, sizeof(peer_ip));
+        memcpy(&peer_port, buf + 8, sizeof(peer_port));
+
+        pid = ntohl(pid);
+        peer_port = ntohs(peer_port);
+
+        if (pid == 0) {
+                printf("File not indexed by registry\n");
+                return 0;
+        }
+
+        printf("File found at\nPeer %u\n%d.%d.%d.%d:%d\n",
+               pid,
+               peer_ip[0], peer_ip[1], peer_ip[2], peer_ip[3],
+               peer_port);
+
+        return 0;
+}
+
+static int handle_fetch(int sock) {
+        (void)sock;
+        printf("FETCH not implemented yet.\n");
+        return 0;
+}
+
+static int read_command(char *buffer, size_t size) {
+        char format[16];
+
+        if (size < 2) {
+                return -1;
+        }
+
+        if (snprintf(format, sizeof(format), "%%%zus", size - 1) < 0) {
+                return -1;
+        }
+
+        if (scanf(format, buffer) != 1) {
+                return -1;
+        }
+
+        return 0;
 }
 
 
