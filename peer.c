@@ -64,6 +64,7 @@ int main(int argc, char *argv[]) {
 
         while(1) {
                 printf("Enter a command: ");
+                fflush(stdout);
                 if (read_command(command, sizeof(command)) != 0) {
                         printf("Failed to read command. Exiting.\n");
                         break;
@@ -156,6 +157,7 @@ static int handle_search(int sock) {
         uint8_t peer_ip[4];
 
         printf("Enter a file name: ");
+        fflush(stdout);
         if (scanf("%254s", filename) != 1) {
                 fprintf(stderr, "Failed to read filename\n");
                 return -1;
@@ -202,6 +204,15 @@ static int handle_search(int sock) {
 
 static int handle_fetch(int sock) {
         (void)sock;
+        char filename[255];
+
+        printf("Filename: ");
+        fflush(stdout);
+        if (scanf("%254s", filename) != 1) {
+                fprintf(stderr, "Failed to read filename\n");
+                return -1;
+        }
+
         printf("FETCH not implemented yet.\n");
         return 0;
 }
