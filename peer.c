@@ -101,12 +101,13 @@ int main(int argc, char *argv[]) {
 }
 
 static int handle_join(int sock, uint32_t id) {
+        // build a 5-byte control message
         char buf[1 + sizeof(uint32_t)];
         uint32_t net_id = htonl(id);
-
+        // store opcode and peer ID in the control message
         buf[0] = 0;
         memcpy(buf + 1, &net_id, sizeof(net_id));
-
+        // send the join request to host
         if (sendall(sock, buf, sizeof(buf)) < 0) {
                 perror("JOIN failed");
                 return -1;
@@ -141,6 +142,7 @@ static int handle_publish(int sock) {
                 } else if (entry->d_type == DT_UNKNOWN) {
                         char path[PATH_MAX];
                         struct stat st;
+                        // edge case if the full SharedFiles/<name> path would overflow
                         if (snprintf(path, sizeof(path), "SharedFiles/%s", entry->d_name) >= (int)sizeof(path)) {
                                 fprintf(stderr, "Path too long for file: %s\n", entry->d_name);
                                 continue;
@@ -153,14 +155,14 @@ static int handle_publish(int sock) {
                 if (!is_regular) {
                         continue;
                 }
-
+                // similar edge case if we run out of room in the publish payload
                 size_t name_len = strlen(entry->d_name);
                 if (buf_idx + name_len + 1 > sizeof(buf)) {
                         fprintf(stderr, "Publish buffer too small for file: %s\n", entry->d_name);
                         closedir(dir);
                         return -1;
                 }
-
+                // push the filename (plus null) into the payload
                 memcpy(buf + buf_idx, entry->d_name, name_len + 1);
                 buf_idx += name_len + 1;
                 count++;
@@ -170,7 +172,7 @@ static int handle_publish(int sock) {
 
         uint32_t net_count = htonl(count);
         memcpy(buf + 1, &net_count, sizeof(net_count));
-
+        // we want to make sure that all the entries reach the registry 
         if (sendall(sock, buf, buf_idx) < 0) {
                 perror("PUBLISH failed");
                 return -1;
@@ -185,16 +187,17 @@ static int handle_search(int sock) {
 
         printf("Enter a file name: ");
         fflush(stdout);
+        // prevents searching for empty or unreadable file names
         if (read_line(filename, sizeof(filename)) != 0 || filename[0] == '\0') {
                 fprintf(stderr, "Failed to read filename\n");
                 return -1;
         }
-
+        // abort if the registry lookup fails
         if (perform_search(sock, filename, &result) < 0) {
                 fprintf(stderr, "SEARCH operation failed\n");
                 return -1;
         }
-
+        // file does not exist in the registry
         if (!result.found) {
                 printf("File not indexed by registry\n");
                 return 0;
@@ -223,21 +226,25 @@ static int handle_fetch(int sock) {
 
         printf("Filename: ");
         fflush(stdout);
+        // make sure the user actually provided a filename to fetch
         if (read_line(filename, sizeof(filename)) != 0 || filename[0] == '\0') {
                 fprintf(stderr, "Failed to read filename\n");
                 return -1;
         }
 
+        // reuse perform_search so we know which peer currently hosts the file
         if (perform_search(sock, filename, &result) < 0) {
                 fprintf(stderr, "FETCH search failed\n");
                 return -1;
         }
 
+        // nothing to fetch if the registry doesn't list the file
         if (!result.found) {
                 printf("File not indexed by registry\n");
                 return 0;
         }
 
+        // turn the registry-provided IP bytes into a printable string
         memcpy(&peer_addr, result.ip, sizeof(result.ip));
         if (inet_ntop(AF_INET, &peer_addr, peer_ip_str, sizeof(peer_ip_str)) == NULL) {
                 perror("inet_ntop");
@@ -250,6 +257,7 @@ static int handle_fetch(int sock) {
                peer_ip_str,
                result.port);
 
+        // dial the peer that hosts the requested file
         snprintf(port_str, sizeof(port_str), "%u", result.port);
         peer_fd = lookup_and_connect(peer_ip_str, port_str);
         if (peer_fd < 0) {
@@ -257,6 +265,7 @@ static int handle_fetch(int sock) {
                 return -1;
         }
 
+        // edge case if the filename can't fit inside the fetch request buffer
         size_t name_len = strlen(filename);
         if (name_len + 2 > sizeof(request)) {
                 fprintf(stderr, "Filename too long\n");
@@ -264,27 +273,32 @@ static int handle_fetch(int sock) {
                 return -1;
         }
 
+        // opcode 3 + filename (null-terminated) is the FETCH request format
         request[0] = 3;
         memcpy(request + 1, filename, name_len + 1);
 
+        // guarantee that the remote peer receives the full FETCH request
         if (sendall(peer_fd, (char *)request, name_len + 2) < 0) {
                 perror("Error sending FETCH request");
                 close(peer_fd);
                 return -1;
         }
 
+        // first byte back is a status code telling us if the peer can serve the file
         if (recvall(peer_fd, (char *)&response_code, 1) <= 0) {
                 perror("Failed to receive FETCH response code");
                 close(peer_fd);
                 return -1;
         }
 
+        // remote peer refused or couldn't find the file
         if (response_code != 0) {
                 printf("Peer reported error fetching %s\n", filename);
                 close(peer_fd);
                 return 0;
         }
 
+        // open a local file so we can stream the incoming bytes to disk
         file = fopen(filename, "wb");
         if (file == NULL) {
                 perror("Failed to open output file");
@@ -292,6 +306,7 @@ static int handle_fetch(int sock) {
                 return -1;
         }
 
+        // read until EOF, writing each chunk to disk
         while ((bytes_received = recv(peer_fd, file_buffer, sizeof(file_buffer), 0)) > 0) {
                 if (fwrite(file_buffer, 1, (size_t)bytes_received, file) != (size_t)bytes_received) {
                         perror("Failed to write to file");
@@ -301,6 +316,7 @@ static int handle_fetch(int sock) {
                 }
         }
 
+        // guard against network errors mid-transfer
         if (bytes_received < 0) {
                 perror("Error receiving file data");
                 fclose(file);
@@ -320,32 +336,39 @@ static int perform_search(int sock, const char *filename, struct search_result *
         size_t name_len = strlen(filename);
         int bytes;
 
+        // edge case if the filename can't fit in the outbound search buffer
         if (name_len + 2 > sizeof(buf)) {
                 fprintf(stderr, "Filename too long\n");
                 return -1;
         }
 
+        // wipe the result struct so we start clean each lookup
         memset(result, 0, sizeof(*result));
 
+        // opcode 2 followed by the filename (null-terminated) is the SEARCH request format
         buf[0] = 2;
         memcpy(buf + 1, filename, name_len + 1);
 
+        // make sure the registry receives the entire search request
         if (sendall(sock, buf, name_len + 2) < 0) {
                 perror("SEARCH send failed");
                 return -1;
         }
 
+        // pull back the fixed-size 10-byte response (peer id + IPv4 + port)
         bytes = recvall(sock, buf, 10);
         if (bytes < 0) {
                 perror("SEARCH receive failed");
                 return -1;
         }
 
+        // bail if we didn't get the full response body
         if (bytes < 10) {
                 fprintf(stderr, "SEARCH response truncated\n");
                 return -1;
         }
 
+        // unpack the registry response payload
         memcpy(&result->peer_id, buf, sizeof(result->peer_id));
         memcpy(result->ip, buf + 4, sizeof(result->ip));
         memcpy(&result->port, buf + 8, sizeof(result->port));
@@ -358,6 +381,7 @@ static int perform_search(int sock, const char *filename, struct search_result *
 }
 
 static int read_command(char *buffer, size_t size) {
+        // treat a failed line read as a command parse failure
         if (read_line(buffer, size) != 0) {
                 return -1;
         }
@@ -365,14 +389,17 @@ static int read_command(char *buffer, size_t size) {
 }
 
 static int read_line(char *buffer, size_t size) {
+        // sanity check so we don't dereference null or zero-length buffers
         if (size == 0 || buffer == NULL) {
                 return -1;
         }
 
+        // fgets reads up to size-1 bytes and null-terminates on success
         if (fgets(buffer, (int)size, stdin) == NULL) {
                 return -1;
         }
 
+        // strip the trailing newline (if any) so callers get clean tokens
         buffer[strcspn(buffer, "\n")] = '\0';
         return 0;
 }
